@@ -1,8 +1,9 @@
 import numpy as np
 import json
-import torch
-import torch.optim as optim
-import torch.nn as nn
+import torch ### CUDA_POSSIBLE
+import torch.optim as optim ### CUDA_POSSIBLE
+from torch.utils.tensorboard import SummaryWriter ### CUDA_POSSIBLE
+import torch.nn as nn ### CUDA_POSSIBLE
 import argparse
 import logging
 import os
@@ -59,7 +60,7 @@ def get_args():
     return args
 
 
-def init_nets(net_configs, n_parties, args, device='cpu'):
+def init_nets(net_configs, n_parties, args, device='cuda:0'):
     nets = {net_i: None for net_i in range(n_parties)}
     if args.dataset in {'mnist', 'cifar10', 'svhn', 'fmnist'}:
         n_classes = 10
@@ -79,7 +80,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
         for net_i in range(n_parties):
             if args.model == 'simple-cnn':
                 net = SimpleCNNMNIST(input_dim=(16 * 4 * 4), hidden_dims=[120, 84], output_dim=10)
-            if device == 'cpu':
+            if device == 'cuda:0':
                 net.to(device)
             else:
                 net = net.cuda()
@@ -90,7 +91,7 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
                 net = ModelFedCon(args.model, args.out_dim, n_classes, net_configs)
             else:
                 net = ModelFedCon_noheader(args.model, args.out_dim, n_classes, net_configs)
-            if device == 'cpu':
+            if device == 'cuda:0':
                 net.to(device)
             else:
                 net = net.cuda()
@@ -105,9 +106,10 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
     return nets, model_meta_data, layer_type
 
 
-def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu"):
+def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, writer, device="cuda:0"):
     net = nn.DataParallel(net)
     net.cuda()
+    logger.info(f'Algorithm: {args.alg}')
     logger.info('Training network %s' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
@@ -118,6 +120,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
     logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
     logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+    
 
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
@@ -152,6 +155,8 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        
+        writer.add_scalar(f'Loss/{net_id}', epoch_loss, epoch)
 
         if epoch % 10 == 0:
             train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
@@ -159,20 +164,23 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
 
             logger.info('>> Training accuracy: %f' % train_acc)
             logger.info('>> Test accuracy: %f' % test_acc)
-
+            
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
-    net.to('cpu')
+    writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, epoch)
+    writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, epoch)
+
+    net.to('cuda:0')
 
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
 
-def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, args,
-                      device="cpu"):
+def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, args, writer,
+                      device="cuda:0"):
     # global_net.to(device)
     net = nn.DataParallel(net)
     net.cuda()
@@ -231,6 +239,7 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
 
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        writer.add_scalar(f'Loss/{net_id}', epoch_loss, epoch)
 
 
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
@@ -238,13 +247,15 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
-    net.to('cpu')
+    writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, epoch)
+    writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, epoch)
+    net.to('cuda:0')
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
 
 def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args,
-                      round, device="cpu"):
+                      round, writer, device="cuda:0"):
     net = nn.DataParallel(net)
     net.cuda()
     logger.info('Training network %s' % str(net_id))
@@ -303,7 +314,7 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
                 nega = cos(pro1, pro3)
                 logits = torch.cat((logits, nega.reshape(-1,1)), dim=1)
 
-                previous_net.to('cpu')
+                previous_net.to('cuda:0')
 
             logits /= temperature
             labels = torch.zeros(x.size(0)).cuda().long()
@@ -326,22 +337,26 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
         epoch_loss1 = sum(epoch_loss1_collector) / len(epoch_loss1_collector)
         epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
         logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
+        writer.add_scalar(f'Loss/local_training/{net_id}', epoch_loss1, epoch)
+        writer.add_scalar(f'Loss/contrastive_loss/{net_id}', epoch_loss2, epoch)
 
 
     for previous_net in previous_nets:
-        previous_net.to('cpu')
+        previous_net.to('cuda:0')
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
     logger.info('>> Training accuracy: %f' % train_acc)
     logger.info('>> Test accuracy: %f' % test_acc)
-    net.to('cpu')
+    writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, epoch)
+    writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, epoch)
+    net.to('cuda:0')
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
 
-def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cpu"):
-    avg_acc = 0.0
+def local_train_net(nets, args, net_dataidx_map, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
+    avg_acc = 0.00
     acc_list = []
     if global_model:
         global_model.cuda()
@@ -358,20 +373,20 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         n_epoch = args.epochs
 
         if args.alg == 'fedavg':
-            trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
+            trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, writer,
                                         device=device)
         elif args.alg == 'fedprox':
             trainacc, testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr,
-                                                  args.optimizer, args.mu, args, device=device)
+                                                  args.optimizer, args.mu, args, writer, device=device)
         elif args.alg == 'moon':
             prev_models=[]
             for i in range(len(prev_model_pool)):
                 prev_models.append(prev_model_pool[i][net_id])
             trainacc, testacc = train_net_fedcon(net_id, net, global_model, prev_models, train_dl_local, test_dl, n_epoch, args.lr,
-                                                  args.optimizer, args.mu, args.temperature, args, round, device=device)
+                                                  args.optimizer, args.mu, args.temperature, args, round, writer=writer, device=device) # Writer is added
 
         elif args.alg == 'local_training':
-            trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
+            trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, writer,
                                           device=device)
         logger.info("net %d final test acc %f" % (net_id, testacc))
         avg_acc += testacc
@@ -381,11 +396,11 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         logger.info("avg test acc %f" % avg_acc)
         logger.info("std acc %f" % np.std(acc_list))
     if global_model:
-        global_model.to('cpu')
+        global_model.to('cuda:0')
     if server_c:
         for param_index, param in enumerate(server_c.parameters()):
             server_c_collector[param_index] = new_server_c_collector[param_index]
-        server_c.to('cpu')
+        server_c.to('cuda:0')
     return nets
 
 
@@ -417,6 +432,18 @@ if __name__ == '__main__':
 
     seed = args.init_seed
     logger.info("#" * 100)
+    
+    time_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    exp_name = time_str + args.alg
+    tensorboard_dir = os.path.join('tensorboard/')
+    tensorboard_path = os.path.join(args.logdir, tensorboard_dir)
+    if not os.path.exists('tensorboard_path'):
+        mkdirs(tensorboard_path)
+    ten_file_path = os.path.join(tensorboard_path, exp_name)
+
+    writer = SummaryWriter(ten_file_path)
+
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -449,9 +476,9 @@ if __name__ == '__main__':
     data_size = len(test_ds_global)
 
     logger.info("Initializing nets")
-    nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cpu')
+    nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cuda:0')
 
-    global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cpu')
+    global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cuda:0')
     global_model = global_models[0]
     n_comm_rounds = args.comm_round
     if args.load_model_file and args.alg != 'plot_visual':
@@ -466,7 +493,7 @@ if __name__ == '__main__':
         old_nets_pool = []
         if args.load_pool_file:
             for nets_id in range(args.model_buffer_size):
-                old_nets, _, _ = init_nets(args.net_config, args.n_parties, args, device='cpu')
+                old_nets, _, _ = init_nets(args.net_config, args.n_parties, args, device='cuda:0')
                 checkpoint = torch.load(args.load_pool_file)
                 for net_id, net in old_nets.items():
                     net.load_state_dict(checkpoint['pool' + str(nets_id) + '_'+'net'+str(net_id)])
@@ -496,13 +523,15 @@ if __name__ == '__main__':
                 net.load_state_dict(global_w)
 
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
+            local_train_net(nets_this_round, args, net_dataidx_map, writer = writer, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
 
 
 
             total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
 
+
+            # This section needs to be experimented for different network strategies for averaging.
 
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
@@ -528,13 +557,17 @@ if __name__ == '__main__':
             global_model.cuda()
             train_acc, train_loss = compute_accuracy(global_model, train_dl_global, device=device)
             test_acc, conf_matrix, _ = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
-            global_model.to('cpu')
+            global_model.to('cuda:0')
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             logger.info('>> Global Model Train loss: %f' % train_loss)
-
+            writer.add_scalar(f'Accuracy/train/global', train_acc)
+            writer.add_scalar(f'Accuracy/test/global', test_acc)
+            writer.add_scalar(f'Loss/global', train_loss)
+            logger.info(f'old_nets_pool: {len(old_nets_pool)}, args.model_buffer_size: {args.model_buffer_size}')
 
             if len(old_nets_pool) < args.model_buffer_size:
+                logger.info(f'The length of old_nets_pool: {old_nets_pool}, args.model_buffer_size: {args.model_buffer_size}')
                 old_nets = copy.deepcopy(nets)
                 for _, net in old_nets.items():
                     net.eval()
@@ -572,7 +605,7 @@ if __name__ == '__main__':
             for net in nets_this_round.values():
                 net.load_state_dict(global_w)
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, device=device)
+            local_train_net(nets_this_round, args, net_dataidx_map, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
 
             total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
@@ -606,11 +639,15 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             logger.info('>> Global Model Train loss: %f' % train_loss)
+            writer.add_scalar(f'Accuracy/train/global', train_acc)
+            writer.add_scalar(f'Accuracy/test/global', test_acc)
+            writer.add_scalar(f'Loss/global', train_loss)
             mkdirs(args.modeldir+'fedavg/')
-            global_model.to('cpu')
+            global_model.to('cuda:0')
 
             torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
+
     elif args.alg == 'fedprox':
 
         for round in range(n_comm_rounds):
@@ -622,8 +659,8 @@ if __name__ == '__main__':
                 net.load_state_dict(global_w)
 
 
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl,test_dl=test_dl, global_model = global_model, device=device)
-            global_model.to('cpu')
+            local_train_net(nets_this_round, args, net_dataidx_map, writer = writer, train_dl=train_dl,test_dl=test_dl, global_model = global_model, device=device)
+            global_model.to('cuda:0')
 
             # update global model
             total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
@@ -650,19 +687,22 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             logger.info('>> Global Model Train loss: %f' % train_loss)
+            writer.add_scalar(f'Accuracy/train/global', train_acc)
+            writer.add_scalar(f'Accuracy/test/global', test_acc)
+            writer.add_scalar(f'Loss/global', train_loss)
             mkdirs(args.modeldir + 'fedprox/')
-            global_model.to('cpu')
+            global_model.to('cuda:0')
             torch.save(global_model.state_dict(), args.modeldir +'fedprox/'+args.log_file_name+ '.pth')
 
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
-        local_train_net(nets, args, net_dataidx_map, train_dl=train_dl,test_dl=test_dl, device=device)
+        local_train_net(nets, args, net_dataidx_map, writer = writer, train_dl=train_dl,test_dl=test_dl, device=device)
         mkdirs(args.modeldir + 'localmodel/')
         for net_id, net in nets.items():
             torch.save(net.state_dict(), args.modeldir + 'localmodel/'+'model'+str(net_id)+args.log_file_name+ '.pth')
 
     elif args.alg == 'all_in':
-        nets, _, _ = init_nets(args.net_config, 1, args, device='cpu')
+        nets, _, _ = init_nets(args.net_config, 1, args, device='cuda:0')
         # nets[0].to(device)
         trainacc, testacc = train_net(0, nets[0], train_dl_global, test_dl, args.epochs, args.lr,
                                       args.optimizer, args, device=device)
