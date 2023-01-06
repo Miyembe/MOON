@@ -10,6 +10,9 @@ import os
 import copy
 import datetime
 import random
+import matplotlib
+import matplotlib.pyplot as plt
+import time
 
 from dm_control import suite
 
@@ -68,6 +71,7 @@ def init_nets(net_configs, n_parties, args, device='cuda:0'):
     # I think I need to make another class for model for DRL applications. 
     # Remove all the if statements and just put the case of DRL and initialise
     # with the number of nets. 
+    print(f"n_parties: {n_parties}")
     nets = {net_i: None for net_i in range(n_parties)}
     if args.dataset in {'mnist', 'cifar10', 'svhn', 'fmnist'}:
         n_classes = 10
@@ -113,66 +117,89 @@ def init_nets(net_configs, n_parties, args, device='cuda:0'):
     return nets, model_meta_data, layer_type
 
 
-def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, round, writer, device="cuda:0"):
-    net = nn.DataParallel(net)
-    net.cuda(device)
-    logger.info(f'Algorithm: {args.alg}')
-    logger.info('Training network %s' % str(net_id))
-    logger.info('n_training: %d' % len(train_dataloader))
-    logger.info('n_test: %d' % len(test_dataloader))
+def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate_steps, epochs, args, round, writer):
 
-    train_acc,_ = compute_accuracy(net, train_dataloader, device=device)
+    # Random action
+    # n_epoch = args.epochs
+    # spec = env.action_spec()
+    # time_step = env.reset()
+    # for i in range(n_epoch):
+    #     action = random_state.uniform(spec.minimum, spec.maximum, spec.shape)
+    #     time_step = env.step(action)
+    #     print(f"ID: {net_id}, num_epoch: {i}, state: {time_step}")
 
-    test_acc, conf_matrix,_ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
-    logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
-    logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
-    
+    agent.is_training = True
+    step = episode = episode_steps = 0
+    episode_reward = 0.
+    observation = None
+    while step < num_iterations:
+        # reset if it is the start of episode
+        if observation is None:
+            observation = deepcopy(env.reset())
+            agent.reset(observation)
 
-    if args_optimizer == 'adam':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
-    elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
-    elif args_optimizer == 'sgd':
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
-                              weight_decay=args.reg)
-    criterion = nn.CrossEntropyLoss().cuda(device)
-
-    cnt = 0
-
-    for epoch in range(epochs):
-        epoch_loss_collector = []
-        for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(device), target.cuda(device)
-
-            optimizer.zero_grad()
-            x.requires_grad = False
-            target.requires_grad = False
-            target = target.long()
-
-            _,_,out = net(x)
-            loss = criterion(out, target)
-
-            loss.backward()
-            optimizer.step()
-
-            cnt += 1
-            epoch_loss_collector.append(loss.item())
-
-        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
-        logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        # agent pick action ...
+        if step <= args.warmup:
+            action = agent.random_action()
+        else:
+            action = agent.select_action(observation)
         
-        writer.add_scalar(f'Loss/{net_id}', epoch_loss, round + epoch)
+        # env response with next_observation, reward, terminate_info
+        observation2, reward, done, info = env.step(action)
+        observation2 = deepcopy(observation2)
+        if max_episode_length and episode_steps >= max_episode_length -1:
+            done = True
 
-        if epoch % 10 == 0:
-            train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
-            test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+        # agent observe and update policy
+        agent.observe(reward, observation2, done)
+        if step > args.warmup :
+            agent.update_policy()
+        
+        # [optional] evaluate
+        if evaluate is not None and validate_steps > 0 and step % validate_steps == 0:
+            policy = lambda x: agent.select_action(x, decay_epsilon=False)
+            validate_reward = evaluate(env, policy, debug=False, visualize=False)
+            if debug: prYellow('[Evaluate] Step_{:07d}: mean_reward:{}'.format(step, validate_reward))
 
-            logger.info('>> Training accuracy: %f' % train_acc)
-            logger.info('>> Test accuracy: %f' % test_acc)
-            writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, round + epoch)
-            writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, round + epoch)
+        # [optional] save intermideate model
+        if step % int(num_iterations/3) == 0:
+            agent.save_model(output)
+
+        # update 
+        step += 1
+        episode_steps += 1
+        episode_reward += reward
+        observation = deepcopy(observation2)
+
+        if done: # end of episode
+            if debug: prGreen('#{}: episode_reward:{} steps:{}'.format(episode,episode_reward,step))
+
+            agent.memory.append(
+                observation,
+                agent.select_action(observation),
+                0., False
+            )
+
+            # reset
+            observation = None
+            episode_steps = 0
+            episode_reward = 0.
+            episode += 1
+        #writer.add_scalar(f'Loss/{net_id}', epoch_loss, round + epoch)
+
+
+
+
+
+        # if epoch % 10 == 0:
+        #     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
+        #     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+        #     logger.info('>> Training accuracy: %f' % train_acc)
+        #     logger.info('>> Test accuracy: %f' % test_acc)
+        #     writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, round + epoch)
+        #     writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, round + epoch)
             
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
@@ -185,7 +212,7 @@ def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_o
     logger.info(' ** Training complete **')
     return train_acc, test_acc
 
-def local_train_net(nets, args, net_dataidx_map, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
+def local_train_net(nets, envs, args, net_dataidx_map, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
     # avg_acc = 0.00
     # acc_list = []
     # if global_model:
@@ -194,19 +221,21 @@ def local_train_net(nets, args, net_dataidx_map, writer, train_dl=None, test_dl=
     #     server_c.cuda(device)
     #     server_c_collector = list(server_c.cuda(device).parameters())
     #     new_server_c_collector = copy.deepcopy(server_c_collector)
+    random_state = np.random.RandomState(42)
     for net_id, net in nets.items():
         # dataidxs = net_dataidx_map[net_id]
 
         # logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         # train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs)
         # train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
-        n_epoch = args.epochs
+        
+
         '''
         run the env with n_epochs - another for loop. 
         '''
-        # if args.alg == 'fedavg':
-        #     trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, round, writer,
-        #                                 device=device)
+        if args.alg == 'fedavg':
+            trainacc, testacc = train_net(net_id, net, env, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, round, writer,
+                                        device=device)
 
         # logger.info("net %d final test acc %f" % (net_id, testacc))
         # avg_acc += testacc
@@ -220,12 +249,29 @@ def local_train_net(nets, args, net_dataidx_map, writer, train_dl=None, test_dl=
     #     server_c.to('cuda:0')
 
     return nets
+def display_frame(frame):
+    height, width, _ = frame.shape
+    dpi = 70
+    fig, ax = plt.subplots(1, 1, figsize=(width / dpi, height / dpi), dpi=dpi)
+    ax.set_axis_off()
+    ax.set_aspect('equal')
+    ax.set_position([0, 0, 1, 1])
+    im = ax.imshow(frame)
+    plt.show()
+    time.sleep(0.1)
+    plt.close()
 
 def init_envs(n_envs, env_name, task_name):
     envs = []
     for i in range(n_envs):
         env = suite.load(env_name, task_name)
+        frame = env.physics.render()
+        print(f"frame: {frame}")
+        display_frame(frame)
         envs.append(env)
+        
+
+    
     return envs
     
 
@@ -311,7 +357,7 @@ if __name__ == '__main__':
     ### New added
     env_name = 'cartpole'
     task_name = 'swingup'
-    envs = init_nets(args.n_parties, env_name, task_name)
+    envs = init_envs(args.n_parties, env_name, task_name)
 
     
     
@@ -341,7 +387,7 @@ if __name__ == '__main__':
             # for net in nets_this_round.values():
             #     net.load_state_dict(global_w)
 
-            local_train_net(nets_this_round, args, net_dataidx_map, round = round, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
+            local_train_net(nets_this_round, envs, args, net_dataidx_map, round = round, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
 
             # total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             # fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
