@@ -13,6 +13,10 @@ import random
 import matplotlib
 import matplotlib.pyplot as plt
 import time
+import dm2gym
+from copy import deepcopy
+from ddpg import DDPG
+import evaluator import Evaluator
 
 from dm_control import suite
 
@@ -117,7 +121,7 @@ def init_nets(net_configs, n_parties, args, device='cuda:0'):
     return nets, model_meta_data, layer_type
 
 
-def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate_steps, epochs, args, round, writer):
+def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate, validate_steps, epochs, args, round, writer):
 
     # Random action
     # n_epoch = args.epochs
@@ -133,6 +137,7 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate
     step = episode = episode_steps = 0
     episode_reward = 0.
     observation = None
+    validate_rewards = []
     while step < num_iterations:
         # reset if it is the start of episode
         if observation is None:
@@ -160,11 +165,12 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate
         if evaluate is not None and validate_steps > 0 and step % validate_steps == 0:
             policy = lambda x: agent.select_action(x, decay_epsilon=False)
             validate_reward = evaluate(env, policy, debug=False, visualize=False)
+            validate_rewards.append(validate_reward)
             if debug: prYellow('[Evaluate] Step_{:07d}: mean_reward:{}'.format(step, validate_reward))
 
         # [optional] save intermideate model
-        if step % int(num_iterations/3) == 0:
-            agent.save_model(output)
+        # if step % int(num_iterations/3) == 0:
+        #     agent.save_model(output)
 
         # update 
         step += 1
@@ -180,6 +186,10 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate
                 agent.select_action(observation),
                 0., False
             )
+            
+            # reward saving
+            validate_rewards.append(episode_reward)
+            logger.info('>> Episode Reward: %f' % episode_reward)
 
             # reset
             observation = None
@@ -201,18 +211,18 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, validate
         #     writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, round + epoch)
         #     writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, round + epoch)
             
-    train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
-    test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+    # train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
+    # test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
-    logger.info('>> Training accuracy: %f' % train_acc)
-    logger.info('>> Test accuracy: %f' % test_acc)
+    # logger.info('>> Training accuracy: %f' % train_acc)
+    # logger.info('>> Test accuracy: %f' % test_acc)
 
-    net.to('cuda:0')
+    # net.to('cuda:0')
 
     logger.info(' ** Training complete **')
-    return train_acc, test_acc
+    return validate_rewards
 
-def local_train_net(nets, envs, args, net_dataidx_map, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
+def local_train_net(agents, envs, args, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
     # avg_acc = 0.00
     # acc_list = []
     # if global_model:
@@ -221,8 +231,8 @@ def local_train_net(nets, envs, args, net_dataidx_map, writer, train_dl=None, te
     #     server_c.cuda(device)
     #     server_c_collector = list(server_c.cuda(device).parameters())
     #     new_server_c_collector = copy.deepcopy(server_c_collector)
-    random_state = np.random.RandomState(42)
-    for net_id, net in nets.items():
+    # random_state = np.random.RandomState(42)
+    for agent_id, agent in agents.items():
         # dataidxs = net_dataidx_map[net_id]
 
         # logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
@@ -233,9 +243,12 @@ def local_train_net(nets, envs, args, net_dataidx_map, writer, train_dl=None, te
         '''
         run the env with n_epochs - another for loop. 
         '''
+        evaluate = Evaluator(args.validate_episodes, 
+        args.validate_steps, args.output, max_episode_length=args.max_episode_length)
+        # 20230106 Define DDPG agent
         if args.alg == 'fedavg':
-            trainacc, testacc = train_net(net_id, net, env, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, round, writer,
-                                        device=device)
+            validate_rewards = train_net(agent_id, agent, env, num_iterations, max_episode_length, 
+                                         evaluate, validate_steps, epochs, args, round, writer)
 
         # logger.info("net %d final test acc %f" % (net_id, testacc))
         # avg_acc += testacc
@@ -248,7 +261,8 @@ def local_train_net(nets, envs, args, net_dataidx_map, writer, train_dl=None, te
     #         server_c_collector[param_index] = new_server_c_collector[param_index]
     #     server_c.to('cuda:0')
 
-    return nets
+    return agents
+
 def display_frame(frame):
     height, width, _ = frame.shape
     dpi = 70
@@ -264,15 +278,34 @@ def display_frame(frame):
 def init_envs(n_envs, env_name, task_name):
     envs = []
     for i in range(n_envs):
-        env = suite.load(env_name, task_name)
+        env = dm2gym.make(domain_name=env_name, task_name, seed=args.seed)
         frame = env.physics.render()
         print(f"frame: {frame}")
         display_frame(frame)
         envs.append(env)
-        
-
-    
     return envs
+
+def spec2shape(ordered_dict):
+    # Calculate total number of numeric values (obs_shape or act_shape) in ordered_dict
+    keys = list(ordered_dict.keys())
+    total_shape = 0
+    for key in keys:
+        n_shape = ordered_dict[key].shape[0]
+        total_shape += n_shape
+    return total_shape
+    
+
+
+def init_agents(n_agents, envs):
+    agents = []
+    for i in range(n_agents):
+        n_states = envs[i].observation_space.shape[0]
+        n_actions = envs[i].action_space.shape[0]
+        agent = DDPG(n_states, n_actions, args)
+        agents.append(agent)
+    
+    return agents
+
     
 
 
@@ -326,9 +359,9 @@ if __name__ == '__main__':
         torch.cuda.manual_seed(seed)
     random.seed(seed)
 
-    logger.info("Partitioning data")
-    X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
-        args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
+    # logger.info("Partitioning data")
+    # X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
+    #     args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
 
     n_party_per_round = int(args.n_parties * args.sample_fraction)
     party_list = [i for i in range(args.n_parties)]
@@ -354,10 +387,13 @@ if __name__ == '__main__':
     logger.info("Initializing nets")
     nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cuda:0')
 
-    ### New added
+    ### dm_control env added
     env_name = 'cartpole'
     task_name = 'swingup'
     envs = init_envs(args.n_parties, env_name, task_name)
+
+    ### DDPG agents are added
+    agents = init_agents(args.n_parties, envs)
 
     
     
@@ -383,11 +419,11 @@ if __name__ == '__main__':
             # if args.server_momentum:
             #     old_w = copy.deepcopy(global_model.state_dict())
 
-            nets_this_round = {k: nets[k] for k in party_list_this_round}
+            #nets_this_round = {k: nets[k] for k in party_list_this_round}
             # for net in nets_this_round.values():
             #     net.load_state_dict(global_w)
 
-            local_train_net(nets_this_round, envs, args, net_dataidx_map, round = round, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
+            local_train_net(agents, envs, args, round = round, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
 
             # total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             # fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
