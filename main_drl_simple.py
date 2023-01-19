@@ -13,15 +13,15 @@ import random
 import matplotlib
 import matplotlib.pyplot as plt
 import time
-import dm2gym
+import dmc2gym
 from copy import deepcopy
-from ddpg import DDPG
-import evaluator import Evaluator
+from ddpg.ddpg import DDPG
+from ddpg.evaluator import Evaluator
 
 from dm_control import suite
 
 
-from model import *
+#from model import *
 from utils import *
 
 
@@ -34,11 +34,11 @@ def get_args():
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate (default: 0.1)')
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=2, help='number of workers in a distributed cluster')
+    parser.add_argument('--n_parties', type=int, default=3, help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
                         help='communication strategy: fedavg/fedprox')
     parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
-    parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
+    parser.add_argument('--init_seed', type=int, default=142, help="Random seed")
     parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
     parser.add_argument('--datadir', type=str, required=False, default="./data/", help="Data directory")
     parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength")
@@ -65,63 +65,45 @@ def get_args():
     parser.add_argument('--save_model',type=int,default=0)
     parser.add_argument('--use_project_head', type=int, default=1)
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
+    
+    # DDPG Related arguments
+    parser.add_argument('--mode', default='train', type=str, help='support option: train/test')
+    #parser.add_argument('--env', default='Pendulum-v0', type=str, help='open-ai gym environment')
+    parser.add_argument('--hidden1', default=400, type=int, help='hidden num of first fully connect layer')
+    parser.add_argument('--hidden2', default=300, type=int, help='hidden num of second fully connect layer')
+    parser.add_argument('--rate', default=0.001, type=float, help='learning rate')
+    parser.add_argument('--prate', default=0.0001, type=float, help='policy net learning rate (only for DDPG)')
+    parser.add_argument('--warmup', default=100, type=int, help='time without training but only filling the replay memory')
+    parser.add_argument('--discount', default=0.99, type=float, help='')
+    parser.add_argument('--bsize', default=64, type=int, help='minibatch size')
+    parser.add_argument('--rmsize', default=6000000, type=int, help='memory size')
+    parser.add_argument('--window_length', default=1, type=int, help='')
+    parser.add_argument('--tau', default=0.001, type=float, help='moving average for target network')
+    parser.add_argument('--ou_theta', default=0.15, type=float, help='noise theta')
+    parser.add_argument('--ou_sigma', default=0.2, type=float, help='noise sigma') 
+    parser.add_argument('--ou_mu', default=0.0, type=float, help='noise mu') 
+    parser.add_argument('--validate_episodes', default=20, type=int, help='how many episode to perform during validate experiment')
+    parser.add_argument('--num_iterations', default=500, type=int, help='')
+    parser.add_argument('--max_episode_length', default=100, type=int, help='')
+    parser.add_argument('--validate_steps', default=2000, type=int, help='how many steps to perform a validate experiment')
+    parser.add_argument('--output', default='output', type=str, help='')
+    parser.add_argument('--debug', dest='debug', action='store_true')
+    parser.add_argument('--init_w', default=0.003, type=float, help='') 
+    parser.add_argument('--train_iter', default=200000, type=int, help='train iters each timestep')
+    parser.add_argument('--epsilon', default=50000, type=int, help='linear decay of exploration policy')
+    parser.add_argument('--seed', default=142, type=int, help='')
+    parser.add_argument('--resume', default='default', type=str, help='Resuming model path for testing')
+    parser.add_argument('--env_name', default='cheetah', type=str, help='domain name for dm2gym')
+    parser.add_argument('--task_name', default='walk', type=str, help='task name for the domain')
+
+    
     args = parser.parse_args()
     return args
 
 
-def init_nets(net_configs, n_parties, args, device='cuda:0'):
-    # Model structure needs to be adjusted in model.py
-    # Number of features for tasks diverges. Also the network structure. 
-    # I think I need to make another class for model for DRL applications. 
-    # Remove all the if statements and just put the case of DRL and initialise
-    # with the number of nets. 
-    print(f"n_parties: {n_parties}")
-    nets = {net_i: None for net_i in range(n_parties)}
-    if args.dataset in {'mnist', 'cifar10', 'svhn', 'fmnist'}:
-        n_classes = 10
-    elif args.dataset == 'celeba':
-        n_classes = 2
-    elif args.dataset == 'cifar100':
-        n_classes = 100
-    elif args.dataset == 'tinyimagenet':
-        n_classes = 200
-    elif args.dataset == 'femnist':
-        n_classes = 26
-    elif args.dataset == 'emnist':
-        n_classes = 47
-    elif args.dataset == 'xray':
-        n_classes = 2
-    if args.normal_model:
-        for net_i in range(n_parties):
-            if args.model == 'simple-cnn':
-                net = SimpleCNNMNIST(input_dim=(16 * 4 * 4), hidden_dims=[120, 84], output_dim=10)
-            if device == 'cuda:0':
-                net.to(device)
-            else:
-                net = net.cuda(device)
-            nets[net_i] = net
-    else:
-        for net_i in range(n_parties):
-            if args.use_project_head:
-                net = ModelFedCon(args.model, args.out_dim, n_classes, net_configs)
-            else:
-                net = ModelFedCon_noheader(args.model, args.out_dim, n_classes, net_configs)
-            if device == 'cuda:0':
-                net.to(device)
-            else:
-                net = net.cuda(device)
-            nets[net_i] = net
-
-    model_meta_data = []
-    layer_type = []
-    for (k, v) in nets[0].state_dict().items():
-        model_meta_data.append(v.shape)
-        layer_type.append(k)
-
-    return nets, model_meta_data, layer_type
 
 
-def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate, validate_steps, epochs, args, round, writer):
+def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate, validate_steps, args, round, writer):
 
     # Random action
     # n_epoch = args.epochs
@@ -137,7 +119,7 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
     step = episode = episode_steps = 0
     episode_reward = 0.
     observation = None
-    validate_rewards = []
+    episode_rewards = []
     while step < num_iterations:
         # reset if it is the start of episode
         if observation is None:
@@ -149,7 +131,7 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
             action = agent.random_action()
         else:
             action = agent.select_action(observation)
-        
+
         # env response with next_observation, reward, terminate_info
         observation2, reward, done, info = env.step(action)
         observation2 = deepcopy(observation2)
@@ -165,21 +147,22 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
         if evaluate is not None and validate_steps > 0 and step % validate_steps == 0:
             policy = lambda x: agent.select_action(x, decay_epsilon=False)
             validate_reward = evaluate(env, policy, debug=False, visualize=False)
-            validate_rewards.append(validate_reward)
-            if debug: prYellow('[Evaluate] Step_{:07d}: mean_reward:{}'.format(step, validate_reward))
+            episode_rewards.append(validate_reward)
+            if args.debug: prYellow('[Evaluate] Step_{:07d}: mean_reward:{}'.format(step, validate_reward))
 
         # [optional] save intermideate model
         # if step % int(num_iterations/3) == 0:
         #     agent.save_model(output)
 
+        #print(f"Step: {step}")
         # update 
         step += 1
         episode_steps += 1
         episode_reward += reward
         observation = deepcopy(observation2)
-
+        
         if done: # end of episode
-            if debug: prGreen('#{}: episode_reward:{} steps:{}'.format(episode,episode_reward,step))
+            if args.debug: prGreen('#{}: episode_reward:{} steps:{}'.format(episode,episode_reward,step))
 
             agent.memory.append(
                 observation,
@@ -188,9 +171,12 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
             )
             
             # reward saving
-            validate_rewards.append(episode_reward)
+            episode_rewards.append(episode_reward)
             logger.info('>> Episode Reward: %f' % episode_reward)
 
+            # Log 
+            print(f"Episode Number: {episode}, Episode steps: {episode_steps}, Episode Reward: {episode_reward}")
+            writer.add_scalar(f'Rewards_{agent_id}', episode_reward, round*max_episode_length + episode)
             # reset
             observation = None
             episode_steps = 0
@@ -220,9 +206,9 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
     # net.to('cuda:0')
 
     logger.info(' ** Training complete **')
-    return validate_rewards
+    return episode_rewards
 
-def local_train_net(agents, envs, args, writer, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
+def local_train_net(agents, envs, args, writer, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cuda:0"):
     # avg_acc = 0.00
     # acc_list = []
     # if global_model:
@@ -232,14 +218,14 @@ def local_train_net(agents, envs, args, writer, train_dl=None, test_dl=None, glo
     #     server_c_collector = list(server_c.cuda(device).parameters())
     #     new_server_c_collector = copy.deepcopy(server_c_collector)
     # random_state = np.random.RandomState(42)
-    for agent_id, agent in agents.items():
+    for agent_id, agent in enumerate(agents):
         # dataidxs = net_dataidx_map[net_id]
 
         # logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
         # train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs)
         # train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
         
-
+        print(f"local_train: agent_id: {agent_id}")
         '''
         run the env with n_epochs - another for loop. 
         '''
@@ -247,8 +233,8 @@ def local_train_net(agents, envs, args, writer, train_dl=None, test_dl=None, glo
         args.validate_steps, args.output, max_episode_length=args.max_episode_length)
         # 20230106 Define DDPG agent
         if args.alg == 'fedavg':
-            validate_rewards = train_net(agent_id, agent, env, num_iterations, max_episode_length, 
-                                         evaluate, validate_steps, epochs, args, round, writer)
+            episode_rewards = train_net(agent_id, agent, envs[agent_id], args.num_iterations, args.max_episode_length, 
+                                         evaluate, args.validate_steps, args, round, writer)
 
         # logger.info("net %d final test acc %f" % (net_id, testacc))
         # avg_acc += testacc
@@ -278,22 +264,12 @@ def display_frame(frame):
 def init_envs(n_envs, env_name, task_name):
     envs = []
     for i in range(n_envs):
-        env = dm2gym.make(domain_name=env_name, task_name, seed=args.seed)
-        frame = env.physics.render()
-        print(f"frame: {frame}")
-        display_frame(frame)
+        env = dmc2gym.make(domain_name=env_name, task_name=task_name, seed=args.seed)
+        #frame = env.physics.render()
+        #print(f"frame: {frame}")
+        #display_frame(frame)
         envs.append(env)
     return envs
-
-def spec2shape(ordered_dict):
-    # Calculate total number of numeric values (obs_shape or act_shape) in ordered_dict
-    keys = list(ordered_dict.keys())
-    total_shape = 0
-    for key in keys:
-        n_shape = ordered_dict[key].shape[0]
-        total_shape += n_shape
-    return total_shape
-    
 
 
 def init_agents(n_agents, envs):
@@ -342,7 +318,7 @@ if __name__ == '__main__':
     seed = args.init_seed
     logger.info("#" * 100)
     
-    time_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    time_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-")
     exp_name = time_str + args.alg
     tensorboard_dir = os.path.join('tensorboard/')
     tensorboard_path = os.path.join(args.logdir, tensorboard_dir)
@@ -363,57 +339,61 @@ if __name__ == '__main__':
     # X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
     #     args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
 
-    n_party_per_round = int(args.n_parties * args.sample_fraction)
-    party_list = [i for i in range(args.n_parties)]
-    party_list_rounds = []
-    if n_party_per_round != args.n_parties:
-        for i in range(args.comm_round):
-            party_list_rounds.append(random.sample(party_list, n_party_per_round))
-    else:
-        for i in range(args.comm_round):
-            party_list_rounds.append(party_list)
+    # n_party_per_round = int(args.n_parties * args.sample_fraction)
+    # party_list = [i for i in range(args.n_parties)]
+    # party_list_rounds = []
+    # if n_party_per_round != args.n_parties:
+    #     for i in range(args.comm_round):
+    #         party_list_rounds.append(random.sample(party_list, n_party_per_round))
+    # else:
+    #     for i in range(args.comm_round):
+    #         party_list_rounds.append(party_list)
 
-    n_classes = len(np.unique(y_train))
+    # n_classes = len(np.unique(y_train))
 
-    train_dl_global, test_dl, train_ds_global, test_ds_global = get_dataloader(args.dataset,
-                                                                               args.datadir,
-                                                                               args.batch_size,
-                                                                               32)
+    # train_dl_global, test_dl, train_ds_global, test_ds_global = get_dataloader(args.dataset,
+    #                                                                            args.datadir,
+    #                                                                            args.batch_size,
+    #                                                                            32)
 
-    print("len train_dl_global:", len(train_ds_global))
-    train_dl=None
-    data_size = len(test_ds_global)
+    # print("len train_dl_global:", len(train_ds_global))
+    # train_dl=None
+    # data_size = len(test_ds_global)
 
-    logger.info("Initializing nets")
-    nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cuda:0')
+    # logger.info("Initializing nets")
+    # nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cuda:0')
 
     ### dm_control env added
-    env_name = 'cartpole'
-    task_name = 'swingup'
+    env_name = args.env_name
+    task_name = args.task_name
     envs = init_envs(args.n_parties, env_name, task_name)
+
+    # Check Obs and Act space for envs - leave it for future use
+    print(f"Observation Space: {envs[0].observation_space.shape[0]}")
+    print(f"Action Space: {envs[0].action_space.shape[0]}")
 
     ### DDPG agents are added
     agents = init_agents(args.n_parties, envs)
 
     
     
-    global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cuda:0')
-    global_model = global_models[0]
+    # global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cuda:0')
+    # global_model = global_models[0]
     n_comm_rounds = args.comm_round
-    if args.load_model_file and args.alg != 'plot_visual':
-        global_model.load_state_dict(torch.load(args.load_model_file))
-        n_comm_rounds -= args.load_model_round
+    # if args.load_model_file and args.alg != 'plot_visual':
+    #     global_model.load_state_dict(torch.load(args.load_model_file))
+    #     n_comm_rounds -= args.load_model_round
 
-    if args.server_momentum:
-        moment_v = copy.deepcopy(global_model.state_dict())
-        for key in moment_v:
-            moment_v[key] = 0
+    # if args.server_momentum:
+    #     moment_v = copy.deepcopy(global_model.state_dict())
+    #     for key in moment_v:
+    #         moment_v[key] = 0
     # Let's put another argument. 
 
     if args.alg == 'fedavg':
         for round in range(n_comm_rounds):
             logger.info("in comm round:" + str(round))
-            party_list_this_round = party_list_rounds[round]
+            #party_list_this_round = party_list_rounds[round]
 
             # global_w = global_model.state_dict()
             # if args.server_momentum:
@@ -423,7 +403,7 @@ if __name__ == '__main__':
             # for net in nets_this_round.values():
             #     net.load_state_dict(global_w)
 
-            local_train_net(agents, envs, args, round = round, writer = writer, train_dl=train_dl, test_dl=test_dl, device=device)
+            local_train_net(agents, envs, args, round = round, writer = writer, device=device)
 
             # total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             # fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
