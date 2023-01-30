@@ -14,6 +14,12 @@ import matplotlib
 import matplotlib.pyplot as plt
 import time
 import dmc2gym
+import gym
+import cv2
+from PIL import Image 
+import imageio
+import csv
+
 from copy import deepcopy
 from ddpg.ddpg import DDPG
 from ddpg.evaluator import Evaluator
@@ -34,15 +40,16 @@ def get_args():
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate (default: 0.1)')
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=3, help='number of workers in a distributed cluster')
+    parser.add_argument('--n_parties', type=int, default=2, help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
                         help='communication strategy: fedavg/fedprox')
-    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
-    parser.add_argument('--init_seed', type=int, default=142, help="Random seed")
+    parser.add_argument('--comm_round', type=int, default=5, help='number of maximum communication roun')
+    parser.add_argument('--seed', type=int, default=142, help="Random seed")
     parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
     parser.add_argument('--datadir', type=str, required=False, default="./data/", help="Data directory")
     parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength")
     parser.add_argument('--logdir', type=str, required=False, default="./logs/", help='Log directory path')
+    parser.add_argument('--outdir', type=str, required=False, default="./output/", help='Log directory path')
     parser.add_argument('--modeldir', type=str, required=False, default="./models/", help='Model directory path')
     parser.add_argument('--beta', type=float, default=0.5,
                         help='The parameter for the dirichlet distribution for data partitioning')
@@ -69,8 +76,8 @@ def get_args():
     # DDPG Related arguments
     parser.add_argument('--mode', default='train', type=str, help='support option: train/test')
     #parser.add_argument('--env', default='Pendulum-v0', type=str, help='open-ai gym environment')
-    parser.add_argument('--hidden1', default=400, type=int, help='hidden num of first fully connect layer')
-    parser.add_argument('--hidden2', default=300, type=int, help='hidden num of second fully connect layer')
+    parser.add_argument('--hidden1', default=128, type=int, help='hidden num of first fully connect layer')
+    parser.add_argument('--hidden2', default=128, type=int, help='hidden num of second fully connect layer')
     parser.add_argument('--rate', default=0.001, type=float, help='learning rate')
     parser.add_argument('--prate', default=0.0001, type=float, help='policy net learning rate (only for DDPG)')
     parser.add_argument('--warmup', default=100, type=int, help='time without training but only filling the replay memory')
@@ -83,20 +90,19 @@ def get_args():
     parser.add_argument('--ou_sigma', default=0.2, type=float, help='noise sigma') 
     parser.add_argument('--ou_mu', default=0.0, type=float, help='noise mu') 
     parser.add_argument('--validate_episodes', default=20, type=int, help='how many episode to perform during validate experiment')
-    parser.add_argument('--num_iterations', default=500, type=int, help='')
-    parser.add_argument('--max_episode_length', default=100, type=int, help='')
+    parser.add_argument('--num_iterations', default=200, type=int, help='')
+    parser.add_argument('--max_episode_length', default=20, type=int, help='')
     parser.add_argument('--validate_steps', default=2000, type=int, help='how many steps to perform a validate experiment')
     parser.add_argument('--output', default='output', type=str, help='')
     parser.add_argument('--debug', dest='debug', action='store_true')
     parser.add_argument('--init_w', default=0.003, type=float, help='') 
     parser.add_argument('--train_iter', default=200000, type=int, help='train iters each timestep')
     parser.add_argument('--epsilon', default=50000, type=int, help='linear decay of exploration policy')
-    parser.add_argument('--seed', default=142, type=int, help='')
+    #parser.add_argument('--seed', default=142, type=int, help='')
     parser.add_argument('--resume', default='default', type=str, help='Resuming model path for testing')
-    parser.add_argument('--env_name', default='cheetah', type=str, help='domain name for dm2gym')
-    parser.add_argument('--task_name', default='walk', type=str, help='task name for the domain')
-
-    
+    parser.add_argument('--env_name', default='cartpole', type=str, help='domain name for dm2gym')
+    parser.add_argument('--task_name', default='swingup', type=str, help='task name for the domain') # If gym is used, use "None" for task_name
+        
     args = parser.parse_args()
     return args
 
@@ -104,16 +110,6 @@ def get_args():
 
 
 def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate, validate_steps, args, round, writer):
-
-    # Random action
-    # n_epoch = args.epochs
-    # spec = env.action_spec()
-    # time_step = env.reset()
-    # for i in range(n_epoch):
-    #     action = random_state.uniform(spec.minimum, spec.maximum, spec.shape)
-    #     time_step = env.step(action)
-    #     print(f"ID: {net_id}, num_epoch: {i}, state: {time_step}")
-
 
     agent.is_training = True
     step = episode = episode_steps = 0
@@ -140,7 +136,7 @@ def train_net(agent_id, agent, env, num_iterations, max_episode_length, evaluate
 
         # agent observe and update policy
         agent.observe(reward, observation2, done)
-        if step > args.warmup :
+        if round > 0 :
             agent.update_policy()
         
         # [optional] evaluate
@@ -261,26 +257,142 @@ def display_frame(frame):
     time.sleep(0.1)
     plt.close()
 
-def init_envs(n_envs, env_name, task_name):
+def init_envs(n_envs, env_name, task_name=None):
     envs = []
     for i in range(n_envs):
-        env = dmc2gym.make(domain_name=env_name, task_name=task_name, seed=args.seed)
-        #frame = env.physics.render()
-        #print(f"frame: {frame}")
-        #display_frame(frame)
-        envs.append(env)
+        if task_name == None:
+            env = gym.make(env_name=env_name, seed=args.seed)
+            #frame = env.physics.render()
+            #print(f"frame: {frame}")
+            #display_frame(frame)
+            envs.append(env)
+        else:
+            env = dmc2gym.make(domain_name=env_name, task_name=task_name, seed=args.seed)
+            envs.append(env)
     return envs
 
 
-def init_agents(n_agents, envs):
+def init_agents(n_agents, envs, algo_name="DDPG"):
     agents = []
     for i in range(n_agents):
         n_states = envs[i].observation_space.shape[0]
         n_actions = envs[i].action_space.shape[0]
-        agent = DDPG(n_states, n_actions, args)
+        if algo_name == "DDPG":
+            agent = DDPG(n_states, n_actions, args)
+        #elif algo_name == "DQN":
+        #    agent = DQN(n_states, n_actions, args)
         agents.append(agent)
     
     return agents
+
+def write_video_PIL(frames, file_name, fps=30):
+
+    imageio.mimwrite(uri=file_name, ims=frames, fps=fps, format='.gif')
+
+def write_frame_number(frame, text):
+    print(f"original frame: {frame}")
+    frame = cv2.UMat(frame)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.3
+    font_thickness = 1
+    font_color = (0, 0, 255)  # BGR format for red color
+
+    # Define the text to be added and its position
+    text_position = (2,10)
+
+    # Add the text to the image
+    cv2.putText(frame, text, text_position, font, font_scale, font_color, font_thickness)
+
+    new_frame = frame.get()
+    print(f"converted frame: {new_frame}")
+    return new_frame
+
+def evaluate_agents(agents, envs, args, file_path, max_episode_step = 200, num_episodes = 5, device="cuda:0"):
+
+    # 0. Initisalise lists to contain
+    frames = [[] for _ in range(len(agents))]
+    avg_rewards = [[] for _ in range(len(agents))]
+    avg_steps = [[] for _ in range(len(agents))]
+    std_rewards = [[] for _ in range(len(agents))]
+    std_steps = [[] for _ in range(len(agents))]
+
+    
+    # 1. Run agents to collect samples and rewards
+    for i, agent in enumerate(agents):
+        rewards = []
+        steps = []
+        for n in range(num_episodes):
+            observation = envs[i].reset()
+            agent.reset(observation)
+            done = False
+            step = 0
+            episode_reward = 0
+            while done == False:
+                #observation....
+                action = agent.select_action(observation)
+
+                # env response with next_observation, reward, terminate_info
+                observation2, reward, done, info = envs[i].step(action)
+                observation2 = deepcopy(observation2)
+                if step >= max_episode_step -1:
+                    done = True
+                
+                
+                frame = envs[i].render()
+                frame = write_frame_number(frame, f"Episode: {n}")
+                frames[i].append(frame)
+
+                step += 1
+                episode_reward += reward
+                observation = deepcopy(observation2)
+                
+                if done: # end of episode
+                    if args.debug: prGreen('#{}: episode_reward:{} steps:{}'.format(episode,episode_reward,step))
+                    rewards.append(episode_reward)
+                    steps.append(step)
+
+        avg_reward = np.average(rewards)
+        std_reward = np.std(rewards)
+        avg_rewards[i].append(avg_reward)
+        std_rewards[i].append(std_reward)
+
+        avg_step = np.average(steps)
+        std_step = np.std(steps)
+        avg_steps[i].append(avg_step)
+        std_steps[i].append(std_step)
+
+    print(f"Evaluation: Frames and samples are collected.")
+
+    # 2. Process collected frames into videos.
+    # Check the frame.
+    
+    # fourcc = cv2.VideoWriter_fourcc('X','V','I','D')
+    for i, agents in enumerate(agents):
+        write_video_PIL(frames[i], f"{file_path}/{i}.gif", fps=30)
+    #     writer = cv2.VideoWriter(f"{file_path}/{i}.avi", fourcc, 10.0, (500, 500))
+    #     for i, frame in enumerate(frames[i]):
+    #         writer.write(frame)
+    #         if i == 0:
+    #             cv2.imwrite(f"{file_path}/{i}.jpg", frame)
+    #     writer.release()
+
+    print(f"Evaluation: Videos are saved.")
+
+    # 3. Save csv file with average & std of reward and steps
+    with open(f"{file_path}/{'avg_std_rewards_steps'}.csv", 'w') as f:
+        writer = csv.writer(f)
+        writer.writerow(["avg_rewards", "std_rewards", "avg_steps", "std_steps"])
+        for i in range(len(avg_rewards)):
+            writer.writerow([avg_rewards[i], std_rewards[i], avg_steps[i], std_steps[i]])
+
+    print(f"Evaluation: CSV file is saved.")
+
+
+
+        
+
+
+
 
     
 
@@ -293,6 +405,11 @@ if __name__ == '__main__':
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
+    mkdirs(args.outdir)
+
+    # print args
+    print(f"env_name: {args.env_name}, task_name: {args.task_name}, network_layer: {args.hidden1}, seed: {args.seed}")
+
     if args.log_file_name is None:
         argument_path = 'experiment_arguments-%s.json' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     else:
@@ -315,7 +432,7 @@ if __name__ == '__main__':
     logger.setLevel(logging.DEBUG)
     logger.info(device)
 
-    seed = args.init_seed
+    seed = args.seed
     logger.info("#" * 100)
     
     time_str = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-")
@@ -329,6 +446,11 @@ if __name__ == '__main__':
     writer = SummaryWriter(ten_file_path)
 
 
+    # Evaluation file saving path
+    eval_file_path = os.path.join(args.outdir, exp_name)
+    mkdirs(eval_file_path)
+    
+    # Seed generation
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -445,3 +567,4 @@ if __name__ == '__main__':
 
             # torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             # torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
+        evaluate_agents(agents, envs, args, eval_file_path, max_episode_step = 100, num_episodes = 5)
