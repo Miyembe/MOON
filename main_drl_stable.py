@@ -20,8 +20,11 @@ from PIL import Image
 import imageio
 import csv
 
+
 from copy import deepcopy
-from ddpg.ddpg import DDPG
+
+from stable_baselines3 import DDPG
+#from ddpg.ddpg import DDPG
 from ddpg.evaluator import Evaluator
 
 from dm_control import suite
@@ -233,7 +236,7 @@ def get_args():
         type=int,
         help="how many episode to perform during validate experiment",
     )
-    parser.add_argument("--num_iterations", default=200, type=int, help="")
+    parser.add_argument("--num_iterations", default=10000, type=int, help="")
     parser.add_argument("--max_episode_length", default=20, type=int, help="")
     parser.add_argument(
         "--validate_steps",
@@ -255,7 +258,7 @@ def get_args():
         "--resume", default="default", type=str, help="Resuming model path for testing"
     )
     parser.add_argument(
-        "--env_name", default="cartpole", type=str, help="domain name for dm2gym"
+        "--env_name", default="Pendulum-v1", type=str, help="domain name for dm2gym"
     )
     parser.add_argument(
         "--task_name", default="swingup", type=str, help="task name for the domain"
@@ -277,109 +280,10 @@ def train_net(
     round,
     writer,
 ):
-
-    agent.is_training = True
-    step = episode = episode_steps = 0
-    episode_reward = 0.0
-    observation = None
-    episode_rewards = []
-    while step < num_iterations:
-        # reset if it is the start of episode
-        if observation is None:
-            observation = deepcopy(env.reset())
-            agent.reset(observation)
-
-        # agent pick action ...
-        if step <= args.warmup:
-            action = agent.random_action()
-        else:
-            action = agent.select_action(observation)
-
-        # env response with next_observation, reward, terminate_info
-        observation2, reward, done, info = env.step(action)
-        observation2 = deepcopy(observation2)
-        if max_episode_length and episode_steps >= max_episode_length - 1:
-            done = True
-
-        # agent observe and update policy
-        agent.observe(reward, observation2, done)
-        if round > 0:
-            agent.update_policy()
-
-        # [optional] evaluate
-        if evaluate is not None and validate_steps > 0 and step % validate_steps == 0:
-            policy = lambda x: agent.select_action(x, decay_epsilon=False)
-            validate_reward = evaluate(env, policy, debug=False, visualize=False)
-            episode_rewards.append(validate_reward)
-            if args.debug:
-                prYellow(
-                    "[Evaluate] Step_{:07d}: mean_reward:{}".format(
-                        step, validate_reward
-                    )
-                )
-
-        # [optional] save intermideate model
-        # if step % int(num_iterations/3) == 0:
-        #     agent.save_model(output)
-
-        # print(f"Step: {step}")
-        # update
-        step += 1
-        episode_steps += 1
-        episode_reward += reward
-        observation = deepcopy(observation2)
-
-        if done:  # end of episode
-            if args.debug:
-                prGreen(
-                    "#{}: episode_reward:{} steps:{}".format(
-                        episode, episode_reward, step
-                    )
-                )
-
-            agent.memory.append(
-                observation, agent.select_action(observation), 0.0, False
-            )
-
-            # reward saving
-            episode_rewards.append(episode_reward)
-            logger.info(">> Episode Reward: %f" % episode_reward)
-
-            # Log
-            print(
-                f"Episode Number: {episode}, Episode steps: {episode_steps}, Episode Reward: {episode_reward}"
-            )
-            writer.add_scalar(
-                f"Rewards_{agent_id}",
-                episode_reward,
-                round * max_episode_length + episode,
-            )
-            # reset
-            observation = None
-            episode_steps = 0
-            episode_reward = 0.0
-            episode += 1
-        # writer.add_scalar(f'Loss/{net_id}', epoch_loss, round + epoch)
-
-        # if epoch % 10 == 0:
-        #     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
-        #     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
-
-        #     logger.info('>> Training accuracy: %f' % train_acc)
-        #     logger.info('>> Test accuracy: %f' % test_acc)
-        #     writer.add_scalar(f'Accuracy/train/{net_id}', train_acc, round + epoch)
-        #     writer.add_scalar(f'Accuracy/test/{net_id}', test_acc, round + epoch)
-
-    # train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
-    # test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
-
-    # logger.info('>> Training accuracy: %f' % train_acc)
-    # logger.info('>> Test accuracy: %f' % test_acc)
-
-    # net.to('cuda:0')
-
-    logger.info(" ** Training complete **")
-    return episode_rewards
+    agent.learn(total_timesteps=num_iterations)
+    
+    agent_parameters = agent.policy.state_dict()
+    return agent_parameters
 
 
 def local_train_net(
@@ -403,6 +307,7 @@ def local_train_net(
     #     server_c_collector = list(server_c.cuda(device).parameters())
     #     new_server_c_collector = copy.deepcopy(server_c_collector)
     # random_state = np.random.RandomState(42)
+    list_parameters = []
     for agent_id, agent in enumerate(agents):
         # dataidxs = net_dataidx_map[net_id]
 
@@ -422,7 +327,7 @@ def local_train_net(
         )
         # 20230106 Define DDPG agent
         if args.alg == "fedavg":
-            episode_rewards = train_net(
+            agent_parameters = train_net(
                 agent_id,
                 agent,
                 envs[agent_id],
@@ -434,6 +339,7 @@ def local_train_net(
                 round,
                 writer,
             )
+            list_parameters.append(agent_parameters)
 
         # logger.info("net %d final test acc %f" % (net_id, testacc))
         # avg_acc += testacc
@@ -446,7 +352,7 @@ def local_train_net(
     #         server_c_collector[param_index] = new_server_c_collector[param_index]
     #     server_c.to('cuda:0')
 
-    return agents
+    return list_parameters
 
 
 def display_frame(frame):
@@ -466,7 +372,8 @@ def init_envs(n_envs, env_name, task_name=None):
     envs = []
     for i in range(n_envs):
         if task_name == None:
-            env = gym.make(env_name=env_name, seed=args.seed)
+            print(f"env_name: {env_name}, seed: {args.seed}")
+            env = gym.make(id=env_name)
             # frame = env.physics.render()
             # print(f"frame: {frame}")
             # display_frame(frame)
@@ -485,7 +392,7 @@ def init_agents(n_agents, envs, algo_name="DDPG"):
         n_states = envs[i].observation_space.shape[0]
         n_actions = envs[i].action_space.shape[0]
         if algo_name == "DDPG":
-            agent = DDPG(n_states, n_actions, args)
+            agent = DDPG("MlpPolicy", envs[i], verbose=1)
         # elif algo_name == "DQN":
         #    agent = DQN(n_states, n_actions, args)
         agents.append(agent)
@@ -707,7 +614,7 @@ if __name__ == "__main__":
     ### dm_control env added
     env_name = args.env_name
     task_name = args.task_name
-    envs = init_envs(args.n_parties, env_name, task_name)
+    envs = init_envs(args.n_parties, env_name)
 
     # Check Obs and Act space for envs - leave it for future use
     print(f"Observation Space: {envs[0].observation_space.shape[0]}")
@@ -742,7 +649,7 @@ if __name__ == "__main__":
             # for net in nets_this_round.values():
             #     net.load_state_dict(global_w)
 
-            local_train_net(
+            list_parameters = local_train_net(
                 agents, envs, args, round=round, writer=writer, device=device
             )
 
@@ -784,6 +691,6 @@ if __name__ == "__main__":
 
             # torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             # torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
-        evaluate_agents(
-            agents, envs, args, eval_file_path, max_episode_step=100, num_episodes=5
-        )
+        # evaluate_agents(
+        #     agents, envs, args, eval_file_path, max_episode_step=100, num_episodes=5
+        # )
