@@ -26,6 +26,7 @@ from copy import deepcopy
 from stable_baselines3 import DDPG
 #from ddpg.ddpg import DDPG
 from ddpg.evaluator import Evaluator
+from collections import OrderedDict
 
 from dm_control import suite
 
@@ -69,7 +70,7 @@ def get_args():
         help="communication strategy: fedavg/fedprox",
     )
     parser.add_argument(
-        "--comm_round", type=int, default=5, help="number of maximum communication roun"
+        "--comm_round", type=int, default=1, help="number of maximum communication roun"
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed")
     parser.add_argument(
@@ -236,7 +237,7 @@ def get_args():
         type=int,
         help="how many episode to perform during validate experiment",
     )
-    parser.add_argument("--num_iterations", default=10000, type=int, help="")
+    parser.add_argument("--num_iterations", default=5000, type=int, help="")
     parser.add_argument("--max_episode_length", default=20, type=int, help="")
     parser.add_argument(
         "--validate_steps",
@@ -279,8 +280,15 @@ def train_net(
     args,
     round,
     writer,
+    logging_path
 ):
     agent.learn(total_timesteps=num_iterations)
+    logger = agent.logger
+    name_to_value = logger.name_to_value
+    name_to_count = logger.name_to_count
+    print(f"logger: {logger}")
+    print(f"name_to_value: {name_to_value}")
+    print(f"name_to_count: {name_to_count}")
     
     agent_parameters = agent.policy.state_dict()
     return agent_parameters
@@ -291,13 +299,14 @@ def local_train_net(
     envs,
     args,
     writer,
+    logging_path,
     global_model=None,
     prev_model_pool=None,
     server_c=None,
     clients_c=None,
     round=None,
     device="cuda:0",
-):
+) -> list: # list of parameters [n]: n is the number of agents
     # avg_acc = 0.00
     # acc_list = []
     # if global_model:
@@ -338,6 +347,7 @@ def local_train_net(
                 args,
                 round,
                 writer,
+                logging_path
             )
             list_parameters.append(agent_parameters)
 
@@ -386,13 +396,13 @@ def init_envs(n_envs, env_name, task_name=None):
     return envs
 
 
-def init_agents(n_agents, envs, algo_name="DDPG"):
+def init_agents(n_agents, envs, logging_path, algo_name="DDPG"):
     agents = []
     for i in range(n_agents):
         n_states = envs[i].observation_space.shape[0]
         n_actions = envs[i].action_space.shape[0]
         if algo_name == "DDPG":
-            agent = DDPG("MlpPolicy", envs[i], verbose=1)
+            agent = DDPG("MlpPolicy", envs[i], verbose=1, tensorboard_log=logging_path)
         # elif algo_name == "DQN":
         #    agent = DQN(n_states, n_actions, args)
         agents.append(agent)
@@ -406,7 +416,6 @@ def write_video_PIL(frames, file_name, fps=30):
 
 
 def write_frame_number(frame, text):
-    print(f"original frame: {frame}")
     frame = cv2.UMat(frame)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.3
@@ -422,7 +431,6 @@ def write_frame_number(frame, text):
     )
 
     new_frame = frame.get()
-    print(f"converted frame: {new_frame}")
     return new_frame
 
 
@@ -513,6 +521,41 @@ def evaluate_agents(
 
     print(f"Evaluation: CSV file is saved.")
 
+def convert_list_tensor_to_numpy(x: list) -> list: # I will move this kind of codes into utils
+    list_np_array = []
+    for tensor in x:
+        np_array = tensor.cpu().numpy()
+        list_np_array.append(np_array)
+    return list_np_array
+
+def parameter_averaging(list_parameters: list) -> list:
+    dict_parameters_post = OrderedDict()
+    for key, value in list_parameters[0].items():
+        list_layers = []
+        for i in range(num_agents):
+            parameters = list_parameters[i]
+            values = convert_list_tensor_to_numpy(parameters[key])
+            list_layers.append(values)
+        averaged_layer = np.mean(list_layers, axis=0) # Need to check if it is correctly averaged.
+        averaged_layer = torch.from_numpy(averaged_layer)
+        # before the values are appended into list_layers, it needs to 
+        dict_parameters_post.update([(key, averaged_layer)]) # Need to check if it is correctly updated.
+    return dict_parameters_post
+
+def compare_averaged_value(list_parameters, dict_parameters_post):
+    list_first_values = []
+    num_agents = len(list_parameters)
+    for parameters in list_parameters:
+        list_values = list(parameters.values())
+        first_value = list_values[0][0][0].cpu()
+        list_first_values.append(np.array(first_value))
+
+    averaged_first_value = list(dict_parameters_post.values())[0][0][0]
+    averaged_first_value_from_list = np.mean(list_first_values)
+    if averaged_first_value == averaged_first_value_from_list:
+        print(f"The values are successfully averaged!")
+    else:
+        print(f"The averaged value is different to the true average.")    
 
 if __name__ == "__main__":
 
@@ -621,7 +664,8 @@ if __name__ == "__main__":
     print(f"Action Space: {envs[0].action_space.shape[0]}")
 
     ### DDPG agents are added
-    agents = init_agents(args.n_parties, envs)
+    num_agents = args.n_parties
+    agents = init_agents(num_agents, envs, ten_file_path, algo_name="DDPG")
 
     # global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cuda:0')
     # global_model = global_models[0]
@@ -650,11 +694,19 @@ if __name__ == "__main__":
             #     net.load_state_dict(global_w)
 
             list_parameters = local_train_net(
-                agents, envs, args, round=round, writer=writer, device=device
+                agents, envs, args, round=round, writer=writer, logging_path=ten_file_path, device=device
             )
+            print(f"Round: {round}, List_keys: {list(list_parameters[0].keys())}")
+
+            dict_parameters_post = parameter_averaging(list_parameters)
+            compare_averaged_value(list_parameters, dict_parameters_post)
+            ########################                   
+            ### FedAvg algorithm ###
+            ########################
 
             # total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
             # fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+
 
             # for net_id, net in enumerate(nets_this_round.values()):
             #     net_para = net.state_dict()
@@ -691,6 +743,14 @@ if __name__ == "__main__":
 
             # torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
             # torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
+        
+            ########################                   
+            ## Parameter Loading  ##
+            ########################
+            # Load the processed parameters into the agent for next run
+            for i in range(num_agents):
+                agents[i].policy.load_state_dict(dict_parameters_post)
+
         # evaluate_agents(
         #     agents, envs, args, eval_file_path, max_episode_step=100, num_episodes=5
         # )
