@@ -60,7 +60,7 @@ def get_args():
     parser.add_argument(
         "--n_parties",
         type=int,
-        default=2,
+        default=6,
         help="number of workers in a distributed cluster",
     )
     parser.add_argument(
@@ -70,7 +70,13 @@ def get_args():
         help="communication strategy: fedavg/fedprox",
     )
     parser.add_argument(
-        "--comm_round", type=int, default=1, help="number of maximum communication roun"
+        "--ratio_update",
+        type=float,
+        default=0.5,
+        help="the ratio of updating the model parameters",
+    )
+    parser.add_argument(
+        "--comm_round", type=int, default=50, help="number of maximum communication roun"
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed")
     parser.add_argument(
@@ -282,14 +288,13 @@ def train_net(
     writer,
     logging_path
 ):
-    agent.learn(total_timesteps=num_iterations)
-    logger = agent.logger
-    name_to_value = logger.name_to_value
-    name_to_count = logger.name_to_count
-    print(f"logger: {logger}")
-    print(f"name_to_value: {name_to_value}")
-    print(f"name_to_count: {name_to_count}")
-    
+    _, logs = agent.learn(total_timesteps=num_iterations)
+
+    # write logs from agent.learn into global writer for tensorboard.
+    for log in logs:
+        real_timestep = log['time/total_timesteps'] + round*args.num_iterations
+        for key, value in log.items():
+            writer.add_scalar(f"agent_{agent_id}/{key}", value, real_timestep)
     agent_parameters = agent.policy.state_dict()
     return agent_parameters
 
@@ -335,21 +340,20 @@ def local_train_net(
             max_episode_length=args.max_episode_length,
         )
         # 20230106 Define DDPG agent
-        if args.alg == "fedavg":
-            agent_parameters = train_net(
-                agent_id,
-                agent,
-                envs[agent_id],
-                args.num_iterations,
-                args.max_episode_length,
-                evaluate,
-                args.validate_steps,
-                args,
-                round,
-                writer,
-                logging_path
-            )
-            list_parameters.append(agent_parameters)
+        agent_parameters = train_net(
+            agent_id,
+            agent,
+            envs[agent_id],
+            args.num_iterations,
+            args.max_episode_length,
+            evaluate,
+            args.validate_steps,
+            args,
+            round,
+            writer,
+            logging_path
+        )
+        list_parameters.append(agent_parameters)
 
         # logger.info("net %d final test acc %f" % (net_id, testacc))
         # avg_acc += testacc
@@ -402,7 +406,7 @@ def init_agents(n_agents, envs, logging_path, algo_name="DDPG"):
         n_states = envs[i].observation_space.shape[0]
         n_actions = envs[i].action_space.shape[0]
         if algo_name == "DDPG":
-            agent = DDPG("MlpPolicy", envs[i], verbose=1, tensorboard_log=logging_path)
+            agent = DDPG("MlpPolicy", envs[i], verbose=1)
         # elif algo_name == "DQN":
         #    agent = DQN(n_states, n_actions, args)
         agents.append(agent)
@@ -528,8 +532,9 @@ def convert_list_tensor_to_numpy(x: list) -> list: # I will move this kind of co
         list_np_array.append(np_array)
     return list_np_array
 
-def parameter_averaging(list_parameters: list) -> list:
+def average_parameters(list_parameters: list) -> OrderedDict:
     dict_parameters_post = OrderedDict()
+    num_agents = len(list_parameters)
     for key, value in list_parameters[0].items():
         list_layers = []
         for i in range(num_agents):
@@ -557,6 +562,67 @@ def compare_averaged_value(list_parameters, dict_parameters_post):
     else:
         print(f"The averaged value is different to the true average.")    
 
+def update_parameters(list_parameters, ratio_update) -> OrderedDict:
+    # Only two elements are given in the list.
+    # First element is the original parameters.
+    # Second element is the averaged parameters.
+    dict_parameters_post = OrderedDict()
+    num_agents = len(list_parameters)
+    for key, value in list_parameters[0].items():
+        list_layers = []
+        for i in range(num_agents):
+            parameters = list_parameters[i]
+            values = convert_list_tensor_to_numpy(parameters[key])
+            if i == 0:
+                values = ratio_update * np.array(values)
+            elif i == 1:
+                values = (1-ratio_update) * np.array(values)
+            else:
+                raise ValueError("More than two set of parameters are given. Only two parameters can be updated")
+            list_layers.append(values)
+        updated_layer = np.sum(list_layers, axis=0) # Need to check if it is correctly averaged.
+        updated_layer = torch.from_numpy(updated_layer)
+        # before the values are appended into list_layers, it needs to 
+        dict_parameters_post.update([(key, updated_layer)]) # Need to check if it is correctly updated.
+    return dict_parameters_post
+
+def federated_learning(list_parameters, ratio_update) -> list:
+    # 1. average all the parameters
+    num_agents = len(list_parameters)
+    list_updated_parameters = []
+    dict_averaged_parameters = average_parameters(list_parameters)
+
+    # 2. update individual parameters with averaged parameters
+    for i in range(num_agents):
+        list_parameters_to_update = [list_parameters[i], dict_averaged_parameters]
+        updated_parameters = update_parameters(list_parameters_to_update, ratio_update)
+        list_updated_parameters.append(updated_parameters)
+    
+    return list_updated_parameters
+
+def swarm_learning(list_parameters, ratio_update) -> list:
+    # 1. average all the parameters
+    num_agents = len(list_parameters)
+    list_dict_averaged_parameters = []
+    for i in range(num_agents):
+        if i == 0:
+            list_parameters_to_average = [list_parameters[-1], list_parameters[0], list_parameters[1]]
+        elif i == num_agents-1:
+            list_parameters_to_average = [list_parameters[0], list_parameters[i], list_parameters[i-1]]
+        else: 
+            list_parameters_to_average = [list_parameters[i+1], list_parameters[i], list_parameters[i-1]]
+        dict_averaged_parameters = average_parameters(list_parameters_to_average)
+        list_dict_averaged_parameters.append(dict_averaged_parameters)
+
+    list_updated_parameters = []
+    # 2. update individual parameters with averaged parameters
+    for i in range(num_agents):
+        list_parameters_to_update = [list_parameters[i], list_dict_averaged_parameters[i]]
+        updated_parameters = update_parameters(list_parameters_to_update, ratio_update)
+        list_updated_parameters.append(updated_parameters)
+    return list_updated_parameters
+
+        
 if __name__ == "__main__":
 
     # let's make another function to initialise the environments and just call the instances.
@@ -680,26 +746,35 @@ if __name__ == "__main__":
     #         moment_v[key] = 0
     # Let's put another argument.
 
-    if args.alg == "fedavg":
+    if args.alg == "independent_learning":
         for round in range(n_comm_rounds):
             logger.info("in comm round:" + str(round))
-            # party_list_this_round = party_list_rounds[round]
 
-            # global_w = global_model.state_dict()
-            # if args.server_momentum:
-            #     old_w = copy.deepcopy(global_model.state_dict())
-
-            # nets_this_round = {k: nets[k] for k in party_list_this_round}
-            # for net in nets_this_round.values():
-            #     net.load_state_dict(global_w)
 
             list_parameters = local_train_net(
                 agents, envs, args, round=round, writer=writer, logging_path=ten_file_path, device=device
             )
-            print(f"Round: {round}, List_keys: {list(list_parameters[0].keys())}")
+            
+            ########################                   
+            ## Parameter Loading  ##
+            ########################
+            # Load the processed parameters into the agent for next run
+            #for i in range(num_agents):
+            #    agents[i].policy.load_state_dict(list_parameters[i])
 
-            dict_parameters_post = parameter_averaging(list_parameters)
-            compare_averaged_value(list_parameters, dict_parameters_post)
+    if args.alg == "fedavg":
+        for round in range(n_comm_rounds):
+            logger.info("in comm round:" + str(round))
+
+
+            list_parameters = local_train_net(
+                agents, envs, args, round=round, writer=writer, logging_path=ten_file_path, device=device
+            )
+            #print(f"Round: {round}, List_keys: {list(list_parameters[0].keys())}")
+
+            #dict_parameters_post = average_parameters(list_parameters)
+            #compare_averaged_value(list_parameters, dict_parameters_post)
+            list_updated_parameters = federated_learning(list_parameters, args.ratio_update)
             ########################                   
             ### FedAvg algorithm ###
             ########################
@@ -749,7 +824,28 @@ if __name__ == "__main__":
             ########################
             # Load the processed parameters into the agent for next run
             for i in range(num_agents):
-                agents[i].policy.load_state_dict(dict_parameters_post)
+                agents[i].policy.load_state_dict(list_updated_parameters[i])
+
+        # evaluate_agents(
+        #     agents, envs, args, eval_file_path, max_episode_step=100, num_episodes=5
+        # )
+    if args.alg == "vanila_swarm_learning":
+        for round in range(n_comm_rounds):
+            logger.info("in comm round:" + str(round))
+
+
+            list_parameters = local_train_net(
+                agents, envs, args, round=round, writer=writer, logging_path=ten_file_path, device=device
+            )
+    
+            list_updated_parameters = swarm_learning(list_parameters, args.ratio_update)
+              
+            ########################                   
+            ## Parameter Loading  ##
+            ########################
+            # Load the processed parameters into the agent for next run
+            for i in range(num_agents):
+                agents[i].policy.load_state_dict(list_updated_parameters[i])
 
         # evaluate_agents(
         #     agents, envs, args, eval_file_path, max_episode_step=100, num_episodes=5
