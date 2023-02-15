@@ -24,6 +24,8 @@ import csv
 from copy import deepcopy
 
 from stable_baselines3 import DDPG
+from stable_baselines3 import TD3
+from stable_baselines3 import SAC
 #from ddpg.ddpg import DDPG
 from ddpg.evaluator import Evaluator
 from collections import OrderedDict
@@ -68,6 +70,12 @@ def get_args():
         type=str,
         default="fedavg",
         help="communication strategy: fedavg/fedprox",
+    )
+    parser.add_argument(
+        "--drl_algo",
+        type=str,
+        default="DDPG",
+        help="Deep Reinforcement Learning Algorithms (DDPG, TD3, SAC)",
     )
     parser.add_argument(
         "--ratio_update",
@@ -288,14 +296,23 @@ def train_net(
     writer,
     logging_path
 ):
-    _, logs = agent.learn(total_timesteps=num_iterations)
+    buffer_path = os.path.join(logging_path, f"agent_{agent_id}_buffer")
+    if os.path.isfile(buffer_path +".pkl"):
+        print(f"Loading replay buffer")
+        #agent.load_replay_buffer(buffer_path)
+    
+    # Train the agent for num_iterations
+    _, logs = agent.learn(total_timesteps=num_iterations, reset_num_timesteps=False)
 
     # write logs from agent.learn into global writer for tensorboard.
     for log in logs:
-        real_timestep = log['time/total_timesteps'] + round*args.num_iterations
+        real_timestep = log['time/total_timesteps']
         for key, value in log.items():
             writer.add_scalar(f"agent_{agent_id}/{key}", value, real_timestep)
+    
+    # Save agent paramters and replay buffer
     agent_parameters = agent.policy.state_dict()
+    #agent.save_replay_buffer(buffer_path)
     return agent_parameters
 
 
@@ -322,6 +339,7 @@ def local_train_net(
     #     new_server_c_collector = copy.deepcopy(server_c_collector)
     # random_state = np.random.RandomState(42)
     list_parameters = []
+    list_buffers = []
     for agent_id, agent in enumerate(agents):
         # dataidxs = net_dataidx_map[net_id]
 
@@ -407,6 +425,12 @@ def init_agents(n_agents, envs, logging_path, algo_name="DDPG"):
         n_actions = envs[i].action_space.shape[0]
         if algo_name == "DDPG":
             agent = DDPG("MlpPolicy", envs[i], verbose=1)
+        elif algo_name == "SAC":
+            agent = SAC("MlpPolicy", envs[i], verbose=1)
+        elif algo_name == "TD3":
+            agent = TD3("MlpPolicy", envs[i], verbose=1)
+        else:
+            raise ValueError(f"No DRL algorithm called {algo_name} is supported.")
         # elif algo_name == "DQN":
         #    agent = DQN(n_states, n_actions, args)
         agents.append(agent)
@@ -731,7 +755,7 @@ if __name__ == "__main__":
 
     ### DDPG agents are added
     num_agents = args.n_parties
-    agents = init_agents(num_agents, envs, ten_file_path, algo_name="DDPG")
+    agents = init_agents(num_agents, envs, ten_file_path, algo_name=args.drl_algo)
 
     # global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cuda:0')
     # global_model = global_models[0]
@@ -759,8 +783,8 @@ if __name__ == "__main__":
             ## Parameter Loading  ##
             ########################
             # Load the processed parameters into the agent for next run
-            #for i in range(num_agents):
-            #    agents[i].policy.load_state_dict(list_parameters[i])
+            for i in range(num_agents):
+                agents[i].policy.load_state_dict(list_parameters[i])
 
     if args.alg == "fedavg":
         for round in range(n_comm_rounds):
