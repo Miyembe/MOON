@@ -13,7 +13,6 @@ import random
 import matplotlib
 import matplotlib.pyplot as plt
 import time
-import dmc2gym
 import gym
 import cv2
 from PIL import Image
@@ -30,7 +29,7 @@ from stable_baselines3 import SAC
 from ddpg.evaluator import Evaluator
 from collections import OrderedDict
 
-from dm_control import suite
+#from dm_control import suite
 
 
 # from model import *
@@ -273,7 +272,7 @@ def get_args():
         "--resume", default="default", type=str, help="Resuming model path for testing"
     )
     parser.add_argument(
-        "--env_name", default="Pendulum-v1", type=str, help="domain name for dm2gym"
+        "--env_name", default="LunarLanderContinuous-v2", type=str, help="domain name for dm2gym"
     )
     parser.add_argument(
         "--task_name", default="swingup", type=str, help="task name for the domain"
@@ -302,8 +301,9 @@ def train_net(
         #agent.load_replay_buffer(buffer_path)
     
     # Train the agent for num_iterations
+    print(f"pre agent: {agent}")
     _, logs = agent.learn(total_timesteps=num_iterations, reset_num_timesteps=False)
-
+    print(f"post agent: {agent}")
     # write logs from agent.learn into global writer for tensorboard.
     for log in logs:
         real_timestep = log['time/total_timesteps']
